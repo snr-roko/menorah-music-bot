@@ -1,7 +1,6 @@
 require('dotenv').config()
 
 const express = require('express')
-const fetch = require('node-fetch')
 const ffmpeg = require('fluent-ffmpeg')
 const { Readable, PassThrough } = require('stream')
 
@@ -33,7 +32,11 @@ function auth(req, res, next) {
 
 async function convertToPCM(trackUrl) {
   const response = await fetch(trackUrl)
-  const buffer = await response.buffer()
+  if (!response.ok) {
+    throw new Error(`Failed to download track: ${response.status} ${response.statusText}`)
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer())
 
   return new Promise((resolve, reject) => {
     const chunks = []
@@ -144,11 +147,23 @@ app.post('/music', auth, async (req, res) => {
     const { action, roomName, trackUrl, trackName } = req.body
 
     if (action === 'play') {
-      await startMusic(roomName, trackUrl, trackName)
+      if (!roomName || !trackUrl) {
+        return res.status(400).json({ error: 'roomName and trackUrl are required' })
+      }
+
+      startMusic(roomName, trackUrl, trackName).catch((error) => {
+        console.error('Music playback failed:', error)
+        bots.delete(roomName)
+      })
+
       return res.json({ success: true })
     }
 
     if (action === 'stop') {
+      if (!roomName) {
+        return res.status(400).json({ error: 'roomName is required' })
+      }
+
       await stopMusic(roomName)
       return res.json({ success: true })
     }
