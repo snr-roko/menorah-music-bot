@@ -74,7 +74,7 @@ async function stopMusic(roomName) {
   const bot = bots.get(roomName)
   if (!bot) return
 
-  bot.stop()
+  await bot.stop()
   bots.delete(roomName)
 }
 
@@ -114,32 +114,73 @@ async function startMusic(roomName, trackUrl, trackName) {
   await room.localParticipant.publishTrack(track, options)
 
   let playing = true
+  let cleanupStarted = false
 
-  bots.set(roomName, {
-    stop: () => {
-      playing = false
-    },
-  })
+  const cleanup = async () => {
+    if (cleanupStarted) return
+    cleanupStarted = true
 
-  let position = 0
-  const FRAME_SIZE = 1600
+    playing = false
 
-  while (playing) {
-    if (position >= pcm.length) position = 0
+    try {
+      await track.close()
+    } catch (error) {
+      console.error('Failed to close music track:', error)
+    }
 
-    const frame = pcm.subarray(position, position + FRAME_SIZE)
-
-    await source.captureFrame(
-      new AudioFrame(frame, 16000, 1, frame.length)
-    )
-
-    position += FRAME_SIZE
-
-    await new Promise((r) => setTimeout(r, 100))
+    try {
+      await room.disconnect()
+    } catch (error) {
+      console.error('Failed to disconnect music bot:', error)
+    }
   }
 
-  await track.close()
-  await room.disconnect()
+  const bot = {
+    stop: cleanup,
+    status: 'playing',
+    trackName: trackName || 'Background Music',
+  }
+
+  bots.set(roomName, bot)
+
+  const playLoop = async () => {
+    let position = 0
+    const FRAME_SIZE = 1600
+
+    try {
+      while (playing) {
+        if (position >= pcm.length) position = 0
+
+        const frame = pcm.subarray(position, position + FRAME_SIZE)
+
+        await source.captureFrame(
+          new AudioFrame(frame, 16000, 1, frame.length)
+        )
+
+        position += FRAME_SIZE
+
+        await new Promise((r) => setTimeout(r, 100))
+      }
+    } catch (error) {
+      bot.status = 'error'
+      bot.error = error.message
+      console.error('Music playback loop failed:', error)
+    } finally {
+      await cleanup()
+
+      if (bots.get(roomName) === bot) {
+        bots.delete(roomName)
+      }
+    }
+  }
+
+  playLoop()
+
+  return {
+    status: 'playing',
+    identity: `music-bot-${roomName}`,
+    trackName: bot.trackName,
+  }
 }
 
 app.post('/music', auth, async (req, res) => {
@@ -151,12 +192,8 @@ app.post('/music', auth, async (req, res) => {
         return res.status(400).json({ error: 'roomName and trackUrl are required' })
       }
 
-      startMusic(roomName, trackUrl, trackName).catch((error) => {
-        console.error('Music playback failed:', error)
-        bots.delete(roomName)
-      })
-
-      return res.json({ success: true })
+      const result = await startMusic(roomName, trackUrl, trackName)
+      return res.json({ success: true, ...result })
     }
 
     if (action === 'stop') {
@@ -166,6 +203,21 @@ app.post('/music', auth, async (req, res) => {
 
       await stopMusic(roomName)
       return res.json({ success: true })
+    }
+
+    if (action === 'status') {
+      if (!roomName) {
+        return res.status(400).json({ error: 'roomName is required' })
+      }
+
+      const bot = bots.get(roomName)
+
+      return res.json({
+        success: true,
+        status: bot?.status ?? 'stopped',
+        trackName: bot?.trackName ?? null,
+        error: bot?.error ?? null,
+      })
     }
 
     res.status(400).json({ error: 'Invalid action' })
