@@ -82,7 +82,13 @@ async function stopMusic(roomName) {
   bots.delete(roomName)
 }
 
-async function startMusic(roomName, trackUrl, trackName) {
+const clampVolume = (volume) => {
+  const parsed = Number(volume)
+  if (!Number.isFinite(parsed)) return 0.35
+  return Math.max(0.05, Math.min(1, parsed))
+}
+
+async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   await stopMusic(roomName)
 
   const room = new Room()
@@ -118,6 +124,7 @@ async function startMusic(roomName, trackUrl, trackName) {
   await room.localParticipant.publishTrack(track, options)
 
   let playing = true
+  let paused = false
   let cleanupStarted = false
 
   const cleanup = async () => {
@@ -154,6 +161,22 @@ async function startMusic(roomName, trackUrl, trackName) {
     samplesSent: 0,
     lastFrameAt: null,
     error: null,
+    volume: clampVolume(requestedVolume),
+    paused: false,
+    pause: () => {
+      paused = true
+      bot.paused = true
+      bot.status = 'paused'
+    },
+    resume: () => {
+      paused = false
+      bot.paused = false
+      bot.status = 'playing'
+    },
+    setVolume: (nextVolume) => {
+      bot.volume = clampVolume(nextVolume)
+      return bot.volume
+    },
   }
 
   bots.set(roomName, bot)
@@ -163,10 +186,32 @@ async function startMusic(roomName, trackUrl, trackName) {
 
     try {
       while (playing) {
+        if (paused) {
+          const silenceFrame = new Int16Array(FRAME_SIZE)
+
+          await source.captureFrame(
+            new AudioFrame(silenceFrame, SAMPLE_RATE, CHANNELS, silenceFrame.length)
+          )
+
+          bot.framesSent += 1
+          bot.samplesSent += silenceFrame.length
+          bot.lastFrameAt = new Date().toISOString()
+
+          await new Promise((r) => setTimeout(r, FRAME_MS))
+          continue
+        }
+
         if (position >= pcm.length) position = 0
 
         const frame = new Int16Array(FRAME_SIZE)
-        frame.set(pcm.subarray(position, position + FRAME_SIZE))
+        const sourceSamples = pcm.subarray(position, position + FRAME_SIZE)
+
+        for (let index = 0; index < sourceSamples.length; index += 1) {
+          frame[index] = Math.max(
+            -32768,
+            Math.min(32767, Math.round(sourceSamples[index] * bot.volume))
+          )
+        }
 
         await source.captureFrame(
           new AudioFrame(frame, SAMPLE_RATE, CHANNELS, frame.length)
@@ -201,19 +246,21 @@ async function startMusic(roomName, trackUrl, trackName) {
     sampleRate: bot.sampleRate,
     frameMs: bot.frameMs,
     durationSeconds: bot.durationSeconds,
+    volume: bot.volume,
+    paused: bot.paused,
   }
 }
 
 app.post('/music', auth, async (req, res) => {
   try {
-    const { action, roomName, trackUrl, trackName } = req.body
+    const { action, roomName, trackUrl, trackName, volume } = req.body
 
     if (action === 'play') {
       if (!roomName || !trackUrl) {
         return res.status(400).json({ error: 'roomName and trackUrl are required' })
       }
 
-      const result = await startMusic(roomName, trackUrl, trackName)
+      const result = await startMusic(roomName, trackUrl, trackName, volume)
       return res.json({ success: true, ...result })
     }
 
@@ -248,6 +295,31 @@ app.post('/music', auth, async (req, res) => {
         samplesSent: bot?.samplesSent ?? 0,
         lastFrameAt: bot?.lastFrameAt ?? null,
         error: bot?.error ?? null,
+        volume: bot?.volume ?? null,
+        paused: bot?.paused ?? false,
+      })
+    }
+
+    if (action === 'pause' || action === 'resume' || action === 'volume') {
+      if (!roomName) {
+        return res.status(400).json({ error: 'roomName is required' })
+      }
+
+      const bot = bots.get(roomName)
+      if (!bot) {
+        return res.status(404).json({ error: 'No music is playing in this room' })
+      }
+
+      if (action === 'pause') bot.pause()
+      if (action === 'resume') bot.resume()
+      if (action === 'volume') bot.setVolume(volume)
+
+      return res.json({
+        success: true,
+        status: bot.status,
+        trackName: bot.trackName,
+        volume: bot.volume,
+        paused: bot.paused,
       })
     }
 
