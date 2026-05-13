@@ -165,12 +165,8 @@ async function startMusic(roomName, trackUrl, trackName) {
       while (playing) {
         if (position >= pcm.length) position = 0
 
-        let frame = pcm.subarray(position, position + FRAME_SIZE)
-        if (frame.length < FRAME_SIZE) {
-          const padded = new Int16Array(FRAME_SIZE)
-          padded.set(frame)
-          frame = padded
-        }
+        const frame = new Int16Array(FRAME_SIZE)
+        frame.set(pcm.subarray(position, position + FRAME_SIZE))
 
         await source.captureFrame(
           new AudioFrame(frame, SAMPLE_RATE, CHANNELS, frame.length)
