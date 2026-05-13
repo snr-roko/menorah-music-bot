@@ -19,6 +19,10 @@ const app = express()
 app.use(express.json())
 
 const bots = new Map()
+const SAMPLE_RATE = 48000
+const CHANNELS = 1
+const FRAME_MS = 10
+const FRAME_SIZE = Math.floor(SAMPLE_RATE * FRAME_MS / 1000)
 
 function auth(req, res, next) {
   const authHeader = req.headers.authorization
@@ -61,11 +65,11 @@ async function convertToPCM(trackUrl) {
     output.on('error', reject)
 
     ffmpeg(input)
-      .inputFormat('mp3')
-      .audioFrequency(16000)
-      .audioChannels(1)
+      .audioFrequency(SAMPLE_RATE)
+      .audioChannels(CHANNELS)
       .audioCodec('pcm_s16le')
       .format('s16le')
+      .on('error', reject)
       .pipe(output)
   })
 }
@@ -105,7 +109,7 @@ async function startMusic(roomName, trackUrl, trackName) {
 
   const pcm = await convertToPCM(trackUrl)
 
-  const source = new AudioSource(16000, 1)
+  const source = new AudioSource(SAMPLE_RATE, CHANNELS)
   const track = LocalAudioTrack.createAudioTrack('music', source)
 
   const options = new TrackPublishOptions()
@@ -139,27 +143,45 @@ async function startMusic(roomName, trackUrl, trackName) {
     stop: cleanup,
     status: 'playing',
     trackName: trackName || 'Background Music',
+    identity: `music-bot-${roomName}`,
+    startedAt: new Date().toISOString(),
+    sampleRate: SAMPLE_RATE,
+    channels: CHANNELS,
+    frameMs: FRAME_MS,
+    pcmSamples: pcm.length,
+    durationSeconds: pcm.length / SAMPLE_RATE,
+    framesSent: 0,
+    samplesSent: 0,
+    lastFrameAt: null,
+    error: null,
   }
 
   bots.set(roomName, bot)
 
   const playLoop = async () => {
     let position = 0
-    const FRAME_SIZE = 1600
 
     try {
       while (playing) {
         if (position >= pcm.length) position = 0
 
-        const frame = pcm.subarray(position, position + FRAME_SIZE)
+        let frame = pcm.subarray(position, position + FRAME_SIZE)
+        if (frame.length < FRAME_SIZE) {
+          const padded = new Int16Array(FRAME_SIZE)
+          padded.set(frame)
+          frame = padded
+        }
 
         await source.captureFrame(
-          new AudioFrame(frame, 16000, 1, frame.length)
+          new AudioFrame(frame, SAMPLE_RATE, CHANNELS, frame.length)
         )
 
         position += FRAME_SIZE
+        bot.framesSent += 1
+        bot.samplesSent += frame.length
+        bot.lastFrameAt = new Date().toISOString()
 
-        await new Promise((r) => setTimeout(r, 100))
+        await new Promise((r) => setTimeout(r, FRAME_MS))
       }
     } catch (error) {
       bot.status = 'error'
@@ -180,6 +202,9 @@ async function startMusic(roomName, trackUrl, trackName) {
     status: 'playing',
     identity: `music-bot-${roomName}`,
     trackName: bot.trackName,
+    sampleRate: bot.sampleRate,
+    frameMs: bot.frameMs,
+    durationSeconds: bot.durationSeconds,
   }
 }
 
@@ -215,7 +240,17 @@ app.post('/music', auth, async (req, res) => {
       return res.json({
         success: true,
         status: bot?.status ?? 'stopped',
+        identity: bot?.identity ?? null,
         trackName: bot?.trackName ?? null,
+        startedAt: bot?.startedAt ?? null,
+        sampleRate: bot?.sampleRate ?? null,
+        channels: bot?.channels ?? null,
+        frameMs: bot?.frameMs ?? null,
+        pcmSamples: bot?.pcmSamples ?? null,
+        durationSeconds: bot?.durationSeconds ?? null,
+        framesSent: bot?.framesSent ?? 0,
+        samplesSent: bot?.samplesSent ?? 0,
+        lastFrameAt: bot?.lastFrameAt ?? null,
         error: bot?.error ?? null,
       })
     }
