@@ -12,6 +12,7 @@ const {
   TrackPublishOptions,
   TrackSource,
 } = require('@livekit/rtc-node')
+const { AudioEncoding } = require('@livekit/rtc-ffi-bindings')
 
 const { AccessToken } = require('livekit-server-sdk')
 
@@ -20,9 +21,10 @@ app.use(express.json())
 
 const bots = new Map()
 const SAMPLE_RATE = 48000
-const CHANNELS = 1
+const CHANNELS = 2
 const FRAME_MS = 10
 const FRAME_SIZE = Math.floor(SAMPLE_RATE * FRAME_MS / 1000)
+const MUSIC_MAX_BITRATE = 192000
 
 function auth(req, res, next) {
   const authHeader = req.headers.authorization
@@ -116,10 +118,13 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   const pcm = await convertToPCM(trackUrl)
 
   const source = new AudioSource(SAMPLE_RATE, CHANNELS)
-  const track = LocalAudioTrack.createAudioTrack('music', source)
+  const track = LocalAudioTrack.createAudioTrack('background-music', source)
 
   const options = new TrackPublishOptions()
-  options.source = TrackSource.SOURCE_MICROPHONE
+  options.source = TrackSource.SOURCE_SCREENSHARE_AUDIO
+  options.audioEncoding = new AudioEncoding({ maxBitrate: BigInt(MUSIC_MAX_BITRATE) })
+  options.dtx = false
+  options.red = true
 
   await room.localParticipant.publishTrack(track, options)
 
@@ -154,9 +159,10 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     startedAt: new Date().toISOString(),
     sampleRate: SAMPLE_RATE,
     channels: CHANNELS,
+    maxBitrate: MUSIC_MAX_BITRATE,
     frameMs: FRAME_MS,
     pcmSamples: pcm.length,
-    durationSeconds: pcm.length / SAMPLE_RATE,
+    durationSeconds: pcm.length / (SAMPLE_RATE * CHANNELS),
     framesSent: 0,
     samplesSent: 0,
     lastFrameAt: null,
@@ -187,10 +193,10 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     try {
       while (playing) {
         if (paused) {
-          const silenceFrame = new Int16Array(FRAME_SIZE)
+          const silenceFrame = new Int16Array(FRAME_SIZE * CHANNELS)
 
           await source.captureFrame(
-            new AudioFrame(silenceFrame, SAMPLE_RATE, CHANNELS, silenceFrame.length)
+            new AudioFrame(silenceFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
           )
 
           bot.framesSent += 1
@@ -203,8 +209,8 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
 
         if (position >= pcm.length) position = 0
 
-        const frame = new Int16Array(FRAME_SIZE)
-        const sourceSamples = pcm.subarray(position, position + FRAME_SIZE)
+        const frame = new Int16Array(FRAME_SIZE * CHANNELS)
+        const sourceSamples = pcm.subarray(position, position + frame.length)
 
         for (let index = 0; index < sourceSamples.length; index += 1) {
           frame[index] = Math.max(
@@ -214,10 +220,10 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
         }
 
         await source.captureFrame(
-          new AudioFrame(frame, SAMPLE_RATE, CHANNELS, frame.length)
+          new AudioFrame(frame, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
         )
 
-        position += FRAME_SIZE
+        position += frame.length
         bot.framesSent += 1
         bot.samplesSent += frame.length
         bot.lastFrameAt = new Date().toISOString()
@@ -244,6 +250,8 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     identity: `music-bot-${roomName}`,
     trackName: bot.trackName,
     sampleRate: bot.sampleRate,
+    channels: bot.channels,
+    maxBitrate: bot.maxBitrate,
     frameMs: bot.frameMs,
     durationSeconds: bot.durationSeconds,
     volume: bot.volume,
@@ -291,6 +299,7 @@ app.post('/music', auth, async (req, res) => {
         frameMs: bot?.frameMs ?? null,
         pcmSamples: bot?.pcmSamples ?? null,
         durationSeconds: bot?.durationSeconds ?? null,
+        maxBitrate: bot?.maxBitrate ?? null,
         framesSent: bot?.framesSent ?? 0,
         samplesSent: bot?.samplesSent ?? 0,
         lastFrameAt: bot?.lastFrameAt ?? null,
