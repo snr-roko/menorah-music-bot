@@ -90,6 +90,16 @@ const clampVolume = (volume) => {
   return Math.max(0.05, Math.min(1, parsed))
 }
 
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: 'healthy',
+    activeBots: bots.size,
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  })
+})
+
 async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   await stopMusic(roomName)
 
