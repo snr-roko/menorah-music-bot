@@ -1,0 +1,15 @@
+# fly.toml — drop this in your project root
+app = "menorah-music-bot"
+primary_region = "ams"  # Amsterdam — closest to Ghana
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
