@@ -165,8 +165,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     pcm = null
   }
 
-  const volume = clampVolume(requestedVolume)
-
   const bot = {
     stop: cleanup,
     status: 'playing',
@@ -182,7 +180,7 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     framesSent: 0,
     lastFrameAt: null,
     error: null,
-    volume,
+    volume: clampVolume(requestedVolume),
     paused: false,
     pause() {
       paused = true
@@ -196,8 +194,7 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     },
     setVolume(v) {
       this.volume = clampVolume(v)
-      volume = this.volume
-      // update the closure variable used by the loop
+      return this.volume
     },
   }
 
