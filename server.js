@@ -26,6 +26,7 @@ const FRAME_SAMPLES = FRAME_SIZE * CHANNELS
 const FRAME_BYTES = FRAME_SAMPLES * 2
 const MUSIC_MAX_BITRATE = 192000
 const DEFAULT_VOLUME = 0.35
+const AUDIO_QUEUE_MS = 1000
 
 const SILENCE_FRAME = new Int16Array(FRAME_SAMPLES)
 
@@ -35,8 +36,6 @@ function auth(req, res, next) {
   }
   next()
 }
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const clampVolume = (volume) => {
   const parsed = Number(volume)
@@ -124,7 +123,7 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   const jwt = await createToken(roomName, trackName)
   await room.connect(process.env.LIVEKIT_URL, jwt)
 
-  const source = new AudioSource(SAMPLE_RATE, CHANNELS)
+  const source = new AudioSource(SAMPLE_RATE, CHANNELS, AUDIO_QUEUE_MS)
   const track = LocalAudioTrack.createAudioTrack('background-music', source)
   const options = new TrackPublishOptions()
   options.source = TrackSource.SOURCE_SCREENSHARE_AUDIO
@@ -216,7 +215,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
       while (pending.length >= FRAME_BYTES && playing) {
         if (paused) {
           await sendSilence()
-          await sleep(FRAME_MS)
           continue
         }
 
@@ -236,7 +234,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
 
         bot.framesSent++
         bot.lastFrameAt = Date.now()
-        await sleep(FRAME_MS)
       }
     }
   }
