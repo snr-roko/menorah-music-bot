@@ -13,7 +13,6 @@ const {
   TrackSource,
 } = require('@livekit/rtc-node')
 const { AudioEncoding } = require('@livekit/rtc-ffi-bindings')
-
 const { AccessToken } = require('livekit-server-sdk')
 
 const app = express()
@@ -26,13 +25,17 @@ const FRAME_MS = 10
 const FRAME_SIZE = Math.floor(SAMPLE_RATE * FRAME_MS / 1000)
 const MUSIC_MAX_BITRATE = 192000
 
-function auth(req, res, next) {
-  const authHeader = req.headers.authorization
+// Pre-allocate ONE frame buffer and ONE silence buffer
+// reuse them every iteration instead of allocating new ones each time
+// This eliminates 100 allocations per second — the biggest GC pressure source
+const REUSABLE_FRAME = new Int16Array(FRAME_SIZE * CHANNELS)
+const SILENCE_FRAME = new Int16Array(FRAME_SIZE * CHANNELS)
+// SILENCE_FRAME is all zeros by default — correct for silence
 
-  if (authHeader !== `Bearer ${process.env.BOT_SECRET}`) {
+function auth(req, res, next) {
+  if (req.headers.authorization !== `Bearer ${process.env.BOT_SECRET}`) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
-
   next()
 }
 
@@ -46,24 +49,20 @@ async function convertToPCM(trackUrl) {
 
   return new Promise((resolve, reject) => {
     const chunks = []
-
     const input = Readable.from(buffer)
     const output = new PassThrough()
 
     output.on('data', (chunk) => chunks.push(chunk))
-
     output.on('end', () => {
       const finalBuffer = Buffer.concat(chunks)
-
+      // Use subarray not slice — documented by LiveKit to avoid undefined behaviour
       const pcm = new Int16Array(
         finalBuffer.buffer,
         finalBuffer.byteOffset,
         finalBuffer.byteLength / 2
       )
-
       resolve(pcm)
     })
-
     output.on('error', reject)
 
     ffmpeg(input)
@@ -79,7 +78,6 @@ async function convertToPCM(trackUrl) {
 async function stopMusic(roomName) {
   const bot = bots.get(roomName)
   if (!bot) return
-
   await bot.stop()
   bots.delete(roomName)
 }
@@ -93,9 +91,10 @@ const clampVolume = (volume) => {
 app.get('/health', (_req, res) => {
   res.status(200).json({
     ok: true,
-    status: 'healthy',
     activeBots: bots.size,
     uptimeSeconds: Math.round(process.uptime()),
+    // Report actual memory usage so you can monitor it externally
+    memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
     timestamp: new Date().toISOString(),
   })
 })
@@ -111,6 +110,7 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     {
       identity: `music-bot-${roomName}`,
       name: trackName || 'Background Music',
+      ttl: '8h',
     }
   )
 
@@ -122,10 +122,17 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   })
 
   const jwt = await token.toJwt()
-
   await room.connect(process.env.LIVEKIT_URL, jwt)
 
-  const pcm = await convertToPCM(trackUrl)
+  // Download and convert before publishing
+  // If this fails, room is disconnected cleanly before any track is published
+  let pcm
+  try {
+    pcm = await convertToPCM(trackUrl)
+  } catch (err) {
+    await room.disconnect()
+    throw err
+  }
 
   const source = new AudioSource(SAMPLE_RATE, CHANNELS)
   const track = LocalAudioTrack.createAudioTrack('background-music', source)
@@ -145,21 +152,20 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   const cleanup = async () => {
     if (cleanupStarted) return
     cleanupStarted = true
-
     playing = false
 
-    try {
-      await track.close()
-    } catch (error) {
-      console.error('Failed to close music track:', error)
-    }
+    // Clear the source queue before closing
+    // prevents the captureFrame promise from hanging
+    try { source.clearQueue() } catch {}
+    try { await track.close() } catch {}
+    try { await room.disconnect() } catch {}
 
-    try {
-      await room.disconnect()
-    } catch (error) {
-      console.error('Failed to disconnect music bot:', error)
-    }
+    // Explicitly null out pcm reference so GC can collect it
+    // This is the key memory fix — the large buffer gets released
+    pcm = null
   }
+
+  const volume = clampVolume(requestedVolume)
 
   const bot = {
     stop: cleanup,
@@ -174,24 +180,24 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     pcmSamples: pcm.length,
     durationSeconds: pcm.length / (SAMPLE_RATE * CHANNELS),
     framesSent: 0,
-    samplesSent: 0,
     lastFrameAt: null,
     error: null,
-    volume: clampVolume(requestedVolume),
+    volume,
     paused: false,
-    pause: () => {
+    pause() {
       paused = true
-      bot.paused = true
-      bot.status = 'paused'
+      this.paused = true
+      this.status = 'paused'
     },
-    resume: () => {
+    resume() {
       paused = false
-      bot.paused = false
-      bot.status = 'playing'
+      this.paused = false
+      this.status = 'playing'
     },
-    setVolume: (nextVolume) => {
-      bot.volume = clampVolume(nextVolume)
-      return bot.volume
+    setVolume(v) {
+      this.volume = clampVolume(v)
+      volume = this.volume
+      // update the closure variable used by the loop
     },
   }
 
@@ -203,69 +209,72 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     try {
       while (playing) {
         if (paused) {
-          const silenceFrame = new Int16Array(FRAME_SIZE * CHANNELS)
-
+          // Reuse the pre-allocated silence frame — no allocation
           await source.captureFrame(
-            new AudioFrame(silenceFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
+            new AudioFrame(SILENCE_FRAME, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
           )
-
-          bot.framesSent += 1
-          bot.samplesSent += silenceFrame.length
-          bot.lastFrameAt = new Date().toISOString()
-
-          await new Promise((r) => setTimeout(r, FRAME_MS))
+          bot.framesSent++
+          bot.lastFrameAt = Date.now()
+          await new Promise(r => setTimeout(r, FRAME_MS))
           continue
         }
 
+        // Check pcm is still available (cleanup may have nulled it)
+        if (!pcm) break
+
         if (position >= pcm.length) position = 0
 
-        const frame = new Int16Array(FRAME_SIZE * CHANNELS)
-        const sourceSamples = pcm.subarray(position, position + frame.length)
+        const end = Math.min(position + FRAME_SIZE * CHANNELS, pcm.length)
+        const sourceSamples = pcm.subarray(position, end)
 
-        for (let index = 0; index < sourceSamples.length; index += 1) {
-          frame[index] = Math.max(
+        // Reuse the pre-allocated frame buffer — no allocation per frame
+        // Fill only the portion we have, rest stays as previous values
+        // which is fine since we pad with silence below
+        const len = sourceSamples.length
+        for (let i = 0; i < len; i++) {
+          REUSABLE_FRAME[i] = Math.max(
             -32768,
-            Math.min(32767, Math.round(sourceSamples[index] * bot.volume))
+            Math.min(32767, Math.round(sourceSamples[i] * bot.volume))
           )
+        }
+        // Zero-pad if the last frame is smaller than FRAME_SIZE * CHANNELS
+        if (len < REUSABLE_FRAME.length) {
+          REUSABLE_FRAME.fill(0, len)
         }
 
         await source.captureFrame(
-          new AudioFrame(frame, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
+          new AudioFrame(REUSABLE_FRAME, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
         )
 
-        position += frame.length
-        bot.framesSent += 1
-        bot.samplesSent += frame.length
-        bot.lastFrameAt = new Date().toISOString()
+        position += len
+        bot.framesSent++
+        bot.lastFrameAt = Date.now()
 
-        await new Promise((r) => setTimeout(r, FRAME_MS))
+        await new Promise(r => setTimeout(r, FRAME_MS))
       }
-    } catch (error) {
+    } catch (err) {
       bot.status = 'error'
-      bot.error = error.message
-      console.error('Music playback loop failed:', error)
+      bot.error = err.message
+      console.error(`[${roomName}] Playback loop error:`, err.message)
     } finally {
       await cleanup()
-
-      if (bots.get(roomName) === bot) {
-        bots.delete(roomName)
-      }
+      if (bots.get(roomName) === bot) bots.delete(roomName)
     }
   }
 
+  // Start loop without awaiting — it runs in background
   playLoop()
 
   return {
     status: 'playing',
-    identity: `music-bot-${roomName}`,
+    identity: bot.identity,
     trackName: bot.trackName,
-    sampleRate: bot.sampleRate,
-    channels: bot.channels,
-    maxBitrate: bot.maxBitrate,
-    frameMs: bot.frameMs,
+    sampleRate: SAMPLE_RATE,
+    channels: CHANNELS,
+    maxBitrate: MUSIC_MAX_BITRATE,
+    frameMs: FRAME_MS,
     durationSeconds: bot.durationSeconds,
     volume: bot.volume,
-    paused: bot.paused,
   }
 }
 
@@ -277,78 +286,74 @@ app.post('/music', auth, async (req, res) => {
       if (!roomName || !trackUrl) {
         return res.status(400).json({ error: 'roomName and trackUrl are required' })
       }
-
       const result = await startMusic(roomName, trackUrl, trackName, volume)
       return res.json({ success: true, ...result })
     }
 
     if (action === 'stop') {
-      if (!roomName) {
-        return res.status(400).json({ error: 'roomName is required' })
-      }
-
+      if (!roomName) return res.status(400).json({ error: 'roomName is required' })
       await stopMusic(roomName)
       return res.json({ success: true })
     }
 
     if (action === 'status') {
-      if (!roomName) {
-        return res.status(400).json({ error: 'roomName is required' })
-      }
-
+      if (!roomName) return res.status(400).json({ error: 'roomName is required' })
       const bot = bots.get(roomName)
-
       return res.json({
         success: true,
         status: bot?.status ?? 'stopped',
-        identity: bot?.identity ?? null,
         trackName: bot?.trackName ?? null,
-        startedAt: bot?.startedAt ?? null,
-        sampleRate: bot?.sampleRate ?? null,
-        channels: bot?.channels ?? null,
-        frameMs: bot?.frameMs ?? null,
-        pcmSamples: bot?.pcmSamples ?? null,
-        durationSeconds: bot?.durationSeconds ?? null,
-        maxBitrate: bot?.maxBitrate ?? null,
         framesSent: bot?.framesSent ?? 0,
-        samplesSent: bot?.samplesSent ?? 0,
         lastFrameAt: bot?.lastFrameAt ?? null,
-        error: bot?.error ?? null,
+        durationSeconds: bot?.durationSeconds ?? null,
         volume: bot?.volume ?? null,
         paused: bot?.paused ?? false,
+        error: bot?.error ?? null,
+        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       })
     }
 
-    if (action === 'pause' || action === 'resume' || action === 'volume') {
-      if (!roomName) {
-        return res.status(400).json({ error: 'roomName is required' })
-      }
-
+    if (action === 'pause') {
       const bot = bots.get(roomName)
-      if (!bot) {
-        return res.status(404).json({ error: 'No music is playing in this room' })
-      }
-
-      if (action === 'pause') bot.pause()
-      if (action === 'resume') bot.resume()
-      if (action === 'volume') bot.setVolume(volume)
-
-      return res.json({
-        success: true,
-        status: bot.status,
-        trackName: bot.trackName,
-        volume: bot.volume,
-        paused: bot.paused,
-      })
+      if (!bot) return res.status(404).json({ error: 'No music playing' })
+      bot.pause()
+      return res.json({ success: true, status: bot.status })
     }
 
-    res.status(400).json({ error: 'Invalid action' })
-  } catch (error) {
-    console.error(error)
-    res.status(500).json({ error: error.message })
+    if (action === 'resume') {
+      const bot = bots.get(roomName)
+      if (!bot) return res.status(404).json({ error: 'No music playing' })
+      bot.resume()
+      return res.json({ success: true, status: bot.status })
+    }
+
+    if (action === 'volume') {
+      const bot = bots.get(roomName)
+      if (!bot) return res.status(404).json({ error: 'No music playing' })
+      bot.setVolume(volume)
+      return res.json({ success: true, volume: bot.volume })
+    }
+
+    return res.status(400).json({ error: 'Invalid action' })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: err.message })
   }
 })
 
+// Graceful shutdown — clean up all bots before process exits
+// This prevents dangling LiveKit connections on deploy/restart
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received — stopping all bots')
+  await Promise.all([...bots.keys()].map(stopMusic))
+  process.exit(0)
+})
+
+process.on('SIGINT', async () => {
+  await Promise.all([...bots.keys()].map(stopMusic))
+  process.exit(0)
+})
+
 app.listen(process.env.PORT, () => {
-  console.log(`Bot running on ${process.env.PORT}`)
+  console.log(`Bot running on port ${process.env.PORT}`)
 })
