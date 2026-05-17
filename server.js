@@ -5,7 +5,6 @@ const ffmpeg = require('fluent-ffmpeg')
 
 const {
   Room,
-  RoomEvent,
   AudioSource,
   LocalAudioTrack,
   AudioFrame,
@@ -25,13 +24,10 @@ const FRAME_MS = 10
 const FRAME_SIZE = Math.floor(SAMPLE_RATE * FRAME_MS / 1000)
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS
 const FRAME_BYTES = FRAME_SAMPLES * 2
-const MUSIC_MAX_BITRATE = 192000
+const MUSIC_MAX_BITRATE = 96000
 const DEFAULT_VOLUME = 0.4
 const MUSIC_GAIN_CEILING = 0.35
-const VOICE_DUCKING_RATIO = 0.45
-const VOICE_DUCK_HOLD_MS = 1400
-const GAIN_RAMP_PER_FRAME = 0.01
-const AUDIO_QUEUE_MS = 1000
+const AUDIO_QUEUE_MS = 1500
 
 const SILENCE_FRAME = new Int16Array(FRAME_SAMPLES)
 
@@ -84,7 +80,7 @@ const createToken = async (roomName, trackName) => {
     roomJoin: true,
     room: roomName,
     canPublish: true,
-    canSubscribe: true,
+    canSubscribe: false,
   })
 
   return token.toJwt()
@@ -93,9 +89,15 @@ const createToken = async (roomName, trackName) => {
 const createPCMStream = (trackUrl) => {
   const command = ffmpeg(trackUrl)
     .inputOptions([
+      '-nostdin',
+      '-hide_banner',
       '-reconnect 1',
       '-reconnect_streamed 1',
+      '-reconnect_at_eof 1',
       '-reconnect_delay_max 2',
+      '-rw_timeout 15000000',
+      '-fflags +discardcorrupt',
+      '-err_detect ignore_err',
     ])
     .noVideo()
     .audioFrequency(SAMPLE_RATE)
@@ -148,7 +150,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   let ffmpegCommand = null
   const outputFrame = new Int16Array(FRAME_SAMPLES)
   const frameBuffer = Buffer.alloc(FRAME_BYTES)
-  let activeGain = 0
 
   const bot = {
     stop: cleanup,
@@ -167,10 +168,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     error: null,
     volume: clampVolume(requestedVolume),
     gain: volumeToGain(requestedVolume),
-    effectiveGain: 0,
-    ducked: false,
-    activeSpeakerCount: 0,
-    lastActiveSpeakerAt: null,
     paused: false,
     pause() {
       paused = true
@@ -187,40 +184,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
       this.gain = volumeToGain(v)
       return this.volume
     },
-  }
-
-  activeGain = bot.gain
-
-  room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
-    const voiceSpeakers = speakers.filter((speaker) => speaker.identity !== bot.identity)
-    bot.activeSpeakerCount = voiceSpeakers.length
-
-    if (voiceSpeakers.length > 0) {
-      bot.lastActiveSpeakerAt = Date.now()
-    }
-  })
-
-  const getTargetGain = () => {
-    const voiceRecentlyActive =
-      bot.lastActiveSpeakerAt !== null &&
-      Date.now() - bot.lastActiveSpeakerAt < VOICE_DUCK_HOLD_MS
-
-    bot.ducked = voiceRecentlyActive
-    return bot.gain * (voiceRecentlyActive ? VOICE_DUCKING_RATIO : 1)
-  }
-
-  const getSmoothedGain = () => {
-    const targetGain = getTargetGain()
-    const delta = targetGain - activeGain
-
-    if (Math.abs(delta) <= GAIN_RAMP_PER_FRAME) {
-      activeGain = targetGain
-    } else {
-      activeGain += Math.sign(delta) * GAIN_RAMP_PER_FRAME
-    }
-
-    bot.effectiveGain = activeGain
-    return activeGain
   }
 
   async function cleanup() {
@@ -271,7 +234,7 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
 
         pending.copy(frameBuffer, 0, 0, FRAME_BYTES)
         pending = pending.subarray(FRAME_BYTES)
-        applyVolumeToFrame(frameBuffer, FRAME_BYTES, getSmoothedGain(), outputFrame)
+        applyVolumeToFrame(frameBuffer, FRAME_BYTES, bot.gain, outputFrame)
 
         await source.captureFrame(
           new AudioFrame(outputFrame, SAMPLE_RATE, CHANNELS, FRAME_SIZE)
@@ -321,12 +284,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
     durationSeconds: bot.durationSeconds,
     volume: bot.volume,
     gain: bot.gain,
-    ducking: {
-      enabled: true,
-      ducked: bot.ducked,
-      ratio: VOICE_DUCKING_RATIO,
-      effectiveGain: bot.effectiveGain,
-    },
   }
 }
 
@@ -367,10 +324,6 @@ app.post('/music', auth, async (req, res) => {
         lastFrameAt: bot?.lastFrameAt ?? null,
         volume: bot?.volume ?? null,
         gain: bot?.gain ?? null,
-        effectiveGain: bot?.effectiveGain ?? null,
-        ducked: bot?.ducked ?? false,
-        activeSpeakerCount: bot?.activeSpeakerCount ?? 0,
-        lastActiveSpeakerAt: bot?.lastActiveSpeakerAt ?? null,
         paused: bot?.paused ?? false,
         error: bot?.error ?? null,
         memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
