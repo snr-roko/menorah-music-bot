@@ -20,14 +20,14 @@ app.use(express.json())
 const bots = new Map()
 const SAMPLE_RATE = 48000
 const CHANNELS = 2
-const FRAME_MS = 10
+const FRAME_MS = 20
 const FRAME_SIZE = Math.floor(SAMPLE_RATE * FRAME_MS / 1000)
 const FRAME_SAMPLES = FRAME_SIZE * CHANNELS
 const FRAME_BYTES = FRAME_SAMPLES * 2
 const MUSIC_MAX_BITRATE = 96000
 const DEFAULT_VOLUME = 0.4
 const MUSIC_GAIN_CEILING = 0.35
-const AUDIO_QUEUE_MS = 1500
+const AUDIO_QUEUE_MS = 2500
 
 const SILENCE_FRAME = new Int16Array(FRAME_SAMPLES)
 
