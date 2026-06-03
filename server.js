@@ -9,7 +9,6 @@ const {
   LocalAudioTrack,
   AudioFrame,
   TrackPublishOptions,
-  TrackSource,
 } = require('@livekit/rtc-node')
 const { AudioEncoding } = require('@livekit/rtc-ffi-bindings')
 const { AccessToken } = require('livekit-server-sdk')
@@ -137,7 +136,6 @@ async function startMusic(roomName, trackUrl, trackName, requestedVolume) {
   const source = new AudioSource(SAMPLE_RATE, CHANNELS, AUDIO_QUEUE_MS)
   const track = LocalAudioTrack.createAudioTrack('background-music', source)
   const options = new TrackPublishOptions()
-  options.source = TrackSource.SOURCE_SCREENSHARE_AUDIO
   options.audioEncoding = new AudioEncoding({ maxBitrate: BigInt(MUSIC_MAX_BITRATE) })
   options.dtx = false
   options.red = true
