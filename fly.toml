@@ -1,3 +1,8 @@
+# fly.toml app configuration file generated for menorah-music-bot on 2026-06-18T13:23:54Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'menorah-music-bot'
 primary_region = 'ams'
 
@@ -16,3 +21,11 @@ primary_region = 'ams'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 2048
+
+[[vm]]
+  memory = '2gb'
+  cpu_kind = 'performance'
+  cpus = 1
+  memory_mb = 2048
+  processes = ['app']
+  size = 'performance-cpu-1x'
