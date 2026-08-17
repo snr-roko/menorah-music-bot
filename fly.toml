@@ -17,7 +17,7 @@ primary_region = 'ams'
   processes = ['app']
 
 [[vm]]
-  memory = '2gb'
+  memory = '3gb'
   cpu_kind = 'performance'
   cpus = 1
   memory_mb = 2048
